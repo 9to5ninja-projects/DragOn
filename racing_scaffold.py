@@ -8,6 +8,11 @@ import pygame
 import random
 
 # ============================================================================
+# VERSION INFO
+# ============================================================================
+VERSION = "0.2.0"
+
+# ============================================================================
 # TUNING CONSTANTS - tweak these to feel out the systems
 # ============================================================================
 
@@ -143,7 +148,7 @@ RACE_PRO = RaceConfig(
 # ============================================================================
 
 class Car:
-    def __init__(self, x, y, color, stats, race_length, is_player=False):
+    def __init__(self, x, y, color, stats, race_length, is_player=False, profile=None):
         self.x = x
         self.y = y  # world position (0 = start, race_length = finish)
         self.width = 20
@@ -161,15 +166,25 @@ class Car:
         # Resources (player only really uses these)
         self.fuel = self.stats.fuel_capacity
         self.heat = 20.0  # start warm
-        self.health = self.stats.durability
         
-        # Component Health (0.0 - 1.0)
-        self.comp_front = 1.0   # Engine
-        self.comp_rear = 1.0    # Fuel Tank
-        self.comp_fl = 1.0      # Front Left Tire
-        self.comp_fr = 1.0      # Front Right Tire
-        self.comp_rl = 1.0      # Rear Left Tire
-        self.comp_rr = 1.0      # Rear Right Tire
+        if is_player and profile:
+            # Load from profile
+            self.health = profile.health
+            self.comp_front = profile.comp_front
+            self.comp_rear = profile.comp_rear
+            self.comp_fl = profile.comp_fl
+            self.comp_fr = profile.comp_fr
+            self.comp_rl = profile.comp_rl
+            self.comp_rr = profile.comp_rr
+        else:
+            # Fresh car (AI or new)
+            self.health = self.stats.durability
+            self.comp_front = 1.0
+            self.comp_rear = 1.0
+            self.comp_fl = 1.0
+            self.comp_fr = 1.0
+            self.comp_rl = 1.0
+            self.comp_rr = 1.0
         
         # Nitro
         self.nitro_charges = NITRO_CHARGES
@@ -356,8 +371,36 @@ class Car:
             self.lateral_speed *= -0.5
             
         # Move forward
-        # Even if dead/empty, we move if we have speed (inertia)
         self.y += self.speed
+        
+        # Clamp position to track
+        if self.x < 0:
+            self.x = 0
+            self.lateral_speed = -self.lateral_speed * 0.5
+        elif self.x > SCREEN_WIDTH:
+            self.x = SCREEN_WIDTH
+            self.lateral_speed = -self.lateral_speed * 0.5
+            
+        # Move forward
+        self.y -= self.speed
+        
+        # Update resources
+        self.update_resources()
+        
+        # Smoke Effects
+        if self.health < self.stats.durability * 0.5:
+            # Damaged smoke
+            if random.random() < 0.3:
+                particles.add(self.x + random.randint(-10, 10), self.y + 10, 
+                              random.uniform(-1, 1), random.uniform(1, 3), 
+                              random.randint(30, 60), (100, 100, 100), random.randint(5, 10))
+        
+        if self.health < self.stats.durability * 0.2:
+             # Heavy smoke / Fire
+             if random.random() < 0.5:
+                particles.add(self.x + random.randint(-10, 10), self.y + 10, 
+                              random.uniform(-1, 1), random.uniform(1, 3), 
+                              random.randint(30, 60), (50, 50, 50), random.randint(8, 15))
         
         # If wrecked (0 health), force stop faster
         if self.health <= 0:
@@ -673,12 +716,14 @@ def handle_physics(cars, obstacles=None):
                     car_a.health = 0
                     car_a.dead = True
                     car_a.speed = 0
+                    particles.add_explosion(car_a.x + car_a.width/2, car_a.y + car_a.height, 20, (255, 50, 0))
                 else:
                     # Glancing blow
                     # Ensure minimum damage even at low speed to prevent infinite stuck loops
                     dmg_amount = max(1.0, obs.damage) 
                     car_a.apply_damage(dmg_amount, "FRONT") 
                     car_a.speed *= 0.5
+                    particles.add_explosion(car_a.x + car_a.width/2, car_a.y + car_a.height/2, 5, (200, 200, 200))
                     
                     # Bounce back slightly
                     if car_a.y < obs.y: 
@@ -699,6 +744,7 @@ def handle_physics(cars, obstacles=None):
                 if abs(dx) > abs(dy):
                     # Side collision - bounce
                     push = COLLISION_BOUNCE
+                    particles.add_explosion(car_a.x + (0 if dx > 0 else car_a.width), car_a.y + car_a.height/2, 5, (255, 200, 0))
                     if dx > 0: # A is to the right
                         car_a.x += push
                         car_b.x -= push
@@ -713,6 +759,7 @@ def handle_physics(cars, obstacles=None):
                         
                 else:
                     # Rear-end collision
+                    particles.add_explosion(car_a.x + car_a.width/2, car_a.y + (car_a.height if dy < 0 else 0), 8, (255, 100, 0))
                     if dy < 0: # A is behind B
                         car_a.speed *= 0.9
                         car_a.y = car_b.y - car_a.height - 1 # Force separate
@@ -745,6 +792,64 @@ def handle_physics(cars, obstacles=None):
                 if abs(car_a.x - car_b.x) < DRAFTING_WIDTH:
                     car_a.is_drafting = True
 
+
+# ============================================================================
+# PARTICLES & VISUALS
+# ============================================================================
+
+class Particle:
+    def __init__(self, x, y, vx, vy, life, color, size, decay=0.95):
+        self.x = x
+        self.y = y
+        self.vx = vx
+        self.vy = vy
+        self.life = life
+        self.max_life = life
+        self.color = color
+        self.size = size
+        self.decay = decay
+
+    def update(self):
+        self.x += self.vx
+        self.y += self.vy
+        self.vx *= self.decay
+        self.vy *= self.decay
+        self.life -= 1
+
+    def draw(self, screen, camera_y):
+        if self.life > 0:
+            # Simple size fade
+            s = max(1, int(self.size * (self.life / self.max_life)))
+            # Fix coordinate system: y increases upwards in world, so screen_y is inverted
+            screen_y = SCREEN_HEIGHT - (self.y - camera_y)
+            pygame.draw.circle(screen, self.color, (int(self.x), int(screen_y)), s)
+
+class ParticleSystem:
+    def __init__(self):
+        self.particles = []
+
+    def add(self, x, y, vx, vy, life, color, size):
+        self.particles.append(Particle(x, y, vx, vy, life, color, size))
+        
+    def add_explosion(self, x, y, count=10, color=(255, 100, 0)):
+        for _ in range(count):
+            vx = random.uniform(-3, 3)
+            vy = random.uniform(-3, 3)
+            life = random.randint(20, 40)
+            size = random.randint(2, 5)
+            self.add(x, y, vx, vy, life, color, size)
+
+    def update(self):
+        self.particles = [p for p in self.particles if p.life > 0]
+        for p in self.particles:
+            p.update()
+
+    def draw(self, screen, camera_y):
+        for p in self.particles:
+            p.draw(screen, camera_y)
+
+# Global particle system for simplicity in this script
+particles = ParticleSystem()
 
 # ============================================================================
 # HUD DRAWING
@@ -930,19 +1035,177 @@ def draw_minimap(surface, player, ai_cars, race_length):
 
 
 # ============================================================================
-# MAIN GAME LOOP
+# GAME STATE & PERSISTENCE
 # ============================================================================
 
-def main():
-    pygame.init()
-    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-    pygame.display.set_caption("Racing Scaffold - Throttle/Fuel/Heat")
-    clock = pygame.time.Clock()
+class PlayerProfile:
+    def __init__(self):
+        self.money = 1000
+        self.current_tier = TIER_1_STARTER
+        
+        # Persistent Car State
+        self.health = self.current_tier.durability
+        self.comp_front = 1.0
+        self.comp_rear = 1.0
+        self.comp_fl = 1.0
+        self.comp_fr = 1.0
+        self.comp_rl = 1.0
+        self.comp_rr = 1.0
+        
+        self.engine_level = 0
+        
+    def get_modified_stats(self):
+        import copy
+        new_stats = copy.copy(self.current_tier)
+        new_stats.max_speed += self.engine_level * 0.5
+        new_stats.acceleration += self.engine_level * 0.02
+        return new_stats
+        
+    def upgrade_engine_cost(self):
+        return (self.engine_level + 1) * 500
+        
+    def upgrade_engine(self):
+        cost = self.upgrade_engine_cost()
+        if self.money >= cost:
+            self.money -= cost
+            self.engine_level += 1
+        
+    def get_repair_cost(self):
+        # Calculate cost based on damage
+        total_damage = 0.0
+        total_damage += (1.0 - self.comp_front)
+        total_damage += (1.0 - self.comp_rear)
+        total_damage += (1.0 - self.comp_fl)
+        total_damage += (1.0 - self.comp_fr)
+        total_damage += (1.0 - self.comp_rl)
+        total_damage += (1.0 - self.comp_rr)
+        
+        # Health damage
+        health_pct = self.health / self.current_tier.durability
+        total_damage += (1.0 - health_pct) * 2.0 # Health is expensive
+        
+        return int(total_damage * 100)
+
+    def repair_all(self):
+        """Repair everything if affordable."""
+        cost = self.get_repair_cost()
+        if self.money >= cost:
+            self.money -= cost
+            self.health = self.current_tier.durability
+            self.comp_front = 1.0
+            self.comp_rear = 1.0
+            self.comp_fl = 1.0
+            self.comp_fr = 1.0
+            self.comp_rl = 1.0
+            self.comp_rr = 1.0
+            return True
+        return False
+        
+    def get_repair_cost(self):
+        """Calculate total repair cost."""
+        total_loss = 0.0
+        # Base health
+        total_loss += (1.0 - (self.health / self.current_tier.durability)) * 100
+        # Components
+        total_loss += (1.0 - self.comp_front) * 50
+        total_loss += (1.0 - self.comp_rear) * 50
+        total_loss += (1.0 - self.comp_fl) * 25
+        total_loss += (1.0 - self.comp_fr) * 25
+        total_loss += (1.0 - self.comp_rl) * 25
+        total_loss += (1.0 - self.comp_rr) * 25
+        
+        return int(total_loss * 2.0) # Multiplier
+
+
+# ============================================================================
+# SCENES
+# ============================================================================
+
+def run_garage(screen, clock, profile):
+    """Garage scene loop."""
+    running = True
+    font_title = pygame.font.Font(None, 64)
+    font_main = pygame.font.Font(None, 36)
+    font_small = pygame.font.Font(None, 24)
     
+    while running:
+        screen.fill((20, 20, 30))
+        
+        # Title
+        title = font_title.render("GARAGE", True, (200, 200, 200))
+        screen.blit(title, (20, 20))
+        
+        # Money
+        money_text = font_main.render(f"FUNDS: ${profile.money}", True, (100, 255, 100))
+        screen.blit(money_text, (SCREEN_WIDTH - 200, 30))
+        
+        # Car Status
+        status_y = 100
+        pygame.draw.rect(screen, (40, 40, 50), (20, status_y, SCREEN_WIDTH - 40, 200))
+        
+        # Health Bar
+        hp_pct = max(0.0, profile.health / profile.current_tier.durability)
+        pygame.draw.rect(screen, (100, 0, 0), (40, status_y + 20, 300, 20))
+        pygame.draw.rect(screen, (0, 200, 0), (40, status_y + 20, int(300 * hp_pct), 20))
+        screen.blit(font_small.render(f"Health: {int(profile.health)}/{int(profile.current_tier.durability)}", True, (255,255,255)), (40, status_y + 45))
+        
+        # Component Status
+        def draw_comp_stat(name, val, x, y):
+            col = (0, 255, 0) if val > 0.8 else (255, 255, 0) if val > 0.4 else (255, 0, 0)
+            txt = font_small.render(f"{name}: {int(val*100)}%", True, col)
+            screen.blit(txt, (x, y))
+            
+        draw_comp_stat("ENGINE", profile.comp_front, 40, status_y + 80)
+        draw_comp_stat("FUEL TANK", profile.comp_rear, 200, status_y + 80)
+        draw_comp_stat("TIRES (F)", (profile.comp_fl + profile.comp_fr)/2, 40, status_y + 110)
+        draw_comp_stat("TIRES (R)", (profile.comp_rl + profile.comp_rr)/2, 200, status_y + 110)
+        
+        # Repair Button
+        repair_cost = profile.get_repair_cost()
+        repair_col = (0, 150, 0) if profile.money >= repair_cost and repair_cost > 0 else (100, 100, 100)
+        pygame.draw.rect(screen, repair_col, (40, status_y + 150, 150, 40))
+        screen.blit(font_main.render(f"REPAIR (${repair_cost})", True, (255,255,255)), (50, status_y + 158))
+        
+        # Upgrade Button
+        upg_cost = profile.upgrade_engine_cost()
+        upg_col = (0, 100, 200) if profile.money >= upg_cost else (100, 100, 100)
+        pygame.draw.rect(screen, upg_col, (220, status_y + 150, 160, 40))
+        screen.blit(font_main.render(f"ENGINE +1 (${upg_cost})", True, (255,255,255)), (230, status_y + 158))
+        screen.blit(font_small.render(f"Lvl: {profile.engine_level}", True, (200, 200, 255)), (230, status_y + 195))
+        
+        # Race Button
+        pygame.draw.rect(screen, (200, 100, 0), (SCREEN_WIDTH - 140, SCREEN_HEIGHT - 80, 120, 60))
+        screen.blit(font_main.render("RACE", True, (255,255,255)), (SCREEN_WIDTH - 110, SCREEN_HEIGHT - 65))
+        
+        # Input
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return "QUIT"
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                mx, my = pygame.mouse.get_pos()
+                
+                # Repair Click
+                if 40 <= mx <= 190 and status_y + 150 <= my <= status_y + 190:
+                    if repair_cost > 0:
+                        profile.repair_all()
+                        
+                # Upgrade Click
+                if 220 <= mx <= 380 and status_y + 150 <= my <= status_y + 190:
+                    profile.upgrade_engine()
+                        
+                # Race Click
+                if SCREEN_WIDTH - 140 <= mx <= SCREEN_WIDTH - 20 and SCREEN_HEIGHT - 80 <= my <= SCREEN_HEIGHT - 20:
+                    return "RACE"
+                    
+        pygame.display.flip()
+        clock.tick(60)
+
+def run_race(screen, clock, profile):
+    """Main race loop."""
     track_center = SCREEN_WIDTH // 2
     
     # Setup Race
-    current_tier = TIER_1_STARTER
+    current_tier = profile.current_tier
     current_race = RACE_ROOKIE
     
     # Update global track length for drawing (hacky, but works for prototype)
@@ -974,7 +1237,9 @@ def main():
         
     # Assign player to last spot
     p_start = grid_positions[-1]
-    player = Car(p_start[0], p_start[1], COLOR_PLAYER, current_tier, current_race.length, is_player=True)
+    # Use modified stats from profile (upgrades)
+    player_stats = profile.get_modified_stats()
+    player = Car(p_start[0], p_start[1], COLOR_PLAYER, player_stats, current_race.length, is_player=True, profile=profile)
     
     # Create AI opponent pack
     ai_cars = []
@@ -994,6 +1259,9 @@ def main():
         ox = random.randint(track_left + 20, track_right - 50)
         otype = random.choice(["rock", "barrier"])
         obstacles.append(Obstacle(ox, oy, otype))
+        
+    # Reset Particles
+    particles.particles = []
         
     running = True
     race_over = False
@@ -1016,33 +1284,30 @@ def main():
         # Input
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                running = False
+                return "QUIT"
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE:
                     player.use_nitro()
-                elif event.key == pygame.K_r:
-                    # Reset race
-                    # Re-calculate grid
-                    grid_positions = []
-                    for i in range(total_cars):
-                        row = i // 2
-                        col = i % 2
-                        x_offset = -grid_spacing_x/2 if col == 0 else grid_spacing_x/2
-                        gx = track_center + x_offset
-                        gy = 200 + row * grid_spacing_y
-                        grid_positions.append((gx, gy))
-                        
-                    p_start = grid_positions[-1]
-                    player = Car(p_start[0], p_start[1], COLOR_PLAYER, current_tier, current_race.length, is_player=True)
-                    ai_cars = []
-                    for i in range(current_race.num_ai):
-                        pos = grid_positions[i]
-                        ai_cars.append(AIDriver(Car(pos[0], pos[1], COLOR_AI, current_tier, current_race.length)))
-                    race_over = False
-                    race_time = 0
-                    popup_timer = 0
-                    game_state = STATE_COUNTDOWN
-                    countdown_timer = 180
+                elif event.key == pygame.K_r and race_over:
+                    # Return to garage
+                    # Save damage state back to profile
+                    profile.health = player.health
+                    profile.comp_front = player.comp_front
+                    profile.comp_rear = player.comp_rear
+                    profile.comp_fl = player.comp_fl
+                    profile.comp_fr = player.comp_fr
+                    profile.comp_rl = player.comp_rl
+                    profile.comp_rr = player.comp_rr
+                    
+                    # Award Money (Simple logic for now)
+                    if player.finished:
+                        # Prize based on rank
+                        # 1st: 100%, 2nd: 70%, 3rd: 50%, etc.
+                        rank_factor = max(0, 1.0 - (player_rank - 1) * 0.1)
+                        winnings = int(current_race.prize_money * rank_factor)
+                        profile.money += winnings
+                    
+                    return "GARAGE"
                     
         # Continuous steering input
         keys = pygame.key.get_pressed()
@@ -1106,6 +1371,9 @@ def main():
             # Physics
             handle_physics(all_cars, obstacles)
             
+            # Particles
+            particles.update()
+            
             # Update finish status
             for car in all_cars:
                 car.check_finish(race_time)
@@ -1143,6 +1411,9 @@ def main():
             
         # Draw player
         player.draw(screen, camera_y)
+        
+        # Draw Particles
+        particles.draw(screen, camera_y)
         
         # Draw minimap
         draw_minimap(screen, player, ai_cars, current_race.length)
@@ -1224,12 +1495,39 @@ def main():
             pygame.draw.rect(screen, (0, 0, 0), text_rect.inflate(20, 10))
             screen.blit(text, text_rect)
             
-            hint = pygame.font.Font(None, 24).render("Press R to restart", True, (150, 150, 150))
-            screen.blit(hint, (SCREEN_WIDTH // 2 - 60, SCREEN_HEIGHT // 3 + 30))
+            hint = pygame.font.Font(None, 24).render("Press R to Return to Garage", True, (150, 150, 150))
+            screen.blit(hint, (SCREEN_WIDTH // 2 - 100, SCREEN_HEIGHT // 3 + 30))
         
         pygame.display.flip()
         clock.tick(60)
-        
+
+
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+    pygame.display.set_caption(f"DragOn v{VERSION} - Death Rally Style")
+    clock = pygame.time.Clock()
+    
+    # Initialize Profile
+    profile = PlayerProfile()
+    
+    # State Machine
+    current_scene = "GARAGE"
+    
+    while True:
+        if current_scene == "GARAGE":
+            result = run_garage(screen, clock, profile)
+            if result == "RACE":
+                current_scene = "RACE"
+            elif result == "QUIT":
+                break
+        elif current_scene == "RACE":
+            result = run_race(screen, clock, profile)
+            if result == "GARAGE":
+                current_scene = "GARAGE"
+            elif result == "QUIT":
+                break
+                
     pygame.quit()
 
 
