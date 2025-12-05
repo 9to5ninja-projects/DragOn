@@ -21,6 +21,8 @@ DRAFTING_WIDTH = 25       # lateral distance to catch draft
 DRAFTING_SPEED_BONUS = 1.5 # extra speed when drafting
 DRAFTING_FUEL_SAVER = 0.5 # multiplier for fuel burn when drafting (50% savings)
 COLLISION_BOUNCE = 2.0    # bounce speed when hitting side-to-side
+COLLISION_DAMAGE_BASE = 2.0
+COLLISION_DAMAGE_FACTOR = 0.5
 
 # Consumption rates per frame at different throttle levels
 # Format: throttle% -> (fuel_burn, heat_gain)
@@ -69,13 +71,14 @@ COLOR_THROTTLE = (200, 200, 100)
 # ============================================================================
 
 class CarStats:
-    def __init__(self, name, max_speed, accel, fuel_cap, heat_cap, cooling_factor=1.0):
+    def __init__(self, name, max_speed, accel, fuel_cap, heat_cap, cooling_factor=1.0, durability=100.0):
         self.name = name
         self.max_speed = max_speed
         self.acceleration = accel
         self.fuel_capacity = fuel_cap
         self.heat_capacity = heat_cap
         self.cooling_factor = cooling_factor # Multiplier for cooling rate
+        self.durability = durability
 
 # Tier Definitions
 TIER_1_STARTER = CarStats(
@@ -84,7 +87,8 @@ TIER_1_STARTER = CarStats(
     accel=0.12,
     fuel_cap=80.0,
     heat_cap=80.0,
-    cooling_factor=0.9
+    cooling_factor=0.9,
+    durability=80.0
 )
 
 TIER_2_STREET = CarStats(
@@ -93,7 +97,8 @@ TIER_2_STREET = CarStats(
     accel=0.15,
     fuel_cap=100.0,
     heat_cap=100.0,
-    cooling_factor=1.0
+    cooling_factor=1.0,
+    durability=100.0
 )
 
 TIER_3_PRO = CarStats(
@@ -102,7 +107,8 @@ TIER_3_PRO = CarStats(
     accel=0.20,
     fuel_cap=120.0,
     heat_cap=120.0,
-    cooling_factor=1.2
+    cooling_factor=1.2,
+    durability=120.0
 )
 
 class RaceConfig:
@@ -155,6 +161,15 @@ class Car:
         # Resources (player only really uses these)
         self.fuel = self.stats.fuel_capacity
         self.heat = 20.0  # start warm
+        self.health = self.stats.durability
+        
+        # Component Health (0.0 - 1.0)
+        self.comp_front = 1.0   # Engine
+        self.comp_rear = 1.0    # Fuel Tank
+        self.comp_fl = 1.0      # Front Left Tire
+        self.comp_fr = 1.0      # Front Right Tire
+        self.comp_rl = 1.0      # Rear Left Tire
+        self.comp_rr = 1.0      # Rear Right Tire
         
         # Nitro
         self.nitro_charges = NITRO_CHARGES
@@ -170,6 +185,11 @@ class Car:
     def get_target_speed(self):
         """Calculate target speed based on throttle percentage."""
         base = self.stats.max_speed * (self.throttle / 100.0)
+        
+        # Engine Damage Penalty (Front)
+        if self.comp_front < 1.0:
+            # Linear penalty up to 50% speed loss
+            base *= (0.5 + 0.5 * self.comp_front)
         
         # Heat penalty
         if self.heat >= HEAT_CRITICAL:
@@ -188,10 +208,36 @@ class Car:
             
         return base
     
+    def apply_damage(self, amount, sector):
+        """Apply damage to specific sector and overall health."""
+        self.health -= amount
+        
+        # Component damage (scaled relative to durability)
+        # If durability is 100, 20 damage = 0.2 component loss
+        comp_loss = amount / self.stats.durability
+        
+        if sector == "FRONT":
+            self.comp_front = max(0.0, self.comp_front - comp_loss)
+        elif sector == "REAR":
+            self.comp_rear = max(0.0, self.comp_rear - comp_loss)
+        elif sector == "FL":
+            self.comp_fl = max(0.0, self.comp_fl - comp_loss)
+        elif sector == "FR":
+            self.comp_fr = max(0.0, self.comp_fr - comp_loss)
+        elif sector == "RL":
+            self.comp_rl = max(0.0, self.comp_rl - comp_loss)
+        elif sector == "RR":
+            self.comp_rr = max(0.0, self.comp_rr - comp_loss)
+            
     def update_resources(self):
         """Burn fuel, generate/dissipate heat based on throttle."""
         if self.dead or self.finished:
             return
+            
+        # Check Health
+        if self.health <= 0:
+            self.dead = True
+            self.health = 0
             
         # Interpolate consumption rates for current throttle
         t = self.throttle
@@ -213,6 +259,12 @@ class Car:
         if heat_delta < 0:
             heat_delta *= self.stats.cooling_factor
         
+        # Fuel Leak (Rear Damage)
+        if self.comp_rear < 0.8:
+            # Leak increases as damage gets worse
+            leak_rate = (0.8 - self.comp_rear) * 0.1
+            fuel_burn += leak_rate
+        
         # Drafting saves fuel
         if self.is_drafting:
             fuel_burn *= DRAFTING_FUEL_SAVER
@@ -232,9 +284,90 @@ class Car:
         # Check death conditions
         if self.fuel <= 0:
             self.fuel = 0
-            self.dead = True
+            # Out of fuel is NOT instant death, just engine cut
+            # self.dead = True 
+            
         if self.heat >= self.stats.heat_capacity:
-            self.dead = True
+            self.dead = True # Overheat kills engine permanently
+            
+    def steer(self, direction):
+        """Apply lateral force."""
+        if self.dead or self.finished:
+            return
+            
+        # Steering Authority
+        # Reduced at high speeds (stability)
+        # Reduced at very low speeds (need movement to turn)
+        
+        speed_factor = 1.0
+        if self.speed > 8.0:
+            speed_factor = 1.0 - ((self.speed - 8.0) * 0.15) # Reduce at high speed
+        elif self.speed < 2.0:
+            speed_factor = self.speed / 2.0 # Reduce at low speed
+            
+        # Tire Damage Penalty
+        # Average of front tires affects turn-in
+        tire_health = (self.comp_fl + self.comp_fr) / 2.0
+        speed_factor *= (0.3 + 0.7 * tire_health)
+            
+        force = direction * 0.4 * max(0.1, speed_factor)
+        self.lateral_speed += force
+        
+    def update(self):
+        """Physics update per frame."""
+        # 1. Longitudinal Physics
+        target = self.get_target_speed()
+        
+        # If out of fuel or dead, target speed is 0 (coasting)
+        if self.fuel <= 0 or self.dead:
+            target = 0
+        
+        # Acceleration / Deceleration
+        if self.speed < target:
+            # Can only accelerate if engine is running
+            if not self.dead and self.fuel > 0:
+                self.speed += self.stats.acceleration
+            else:
+                # Coasting friction (no engine power)
+                self.speed -= 0.05
+        elif self.speed > target:
+            # Coasting friction
+            self.speed -= 0.05
+            
+        # 2. Lateral Physics (Inertia)
+        self.x += self.lateral_speed
+        
+        # Tire Grip / Drag (Lateral friction)
+        # Rear tires affect stability/grip
+        rear_grip = (self.comp_rl + self.comp_rr) / 2.0
+        friction = 0.90 * (0.8 + 0.2 * rear_grip)
+        
+        self.lateral_speed *= friction 
+        
+        # Track Limits (Bounce)
+        track_left = (SCREEN_WIDTH - TRACK_WIDTH) // 2
+        track_right = track_left + TRACK_WIDTH
+        
+        if self.x < track_left:
+            self.x = track_left
+            self.lateral_speed *= -0.5
+        elif self.x + self.width > track_right:
+            self.x = track_right - self.width
+            self.lateral_speed *= -0.5
+            
+        # Move forward
+        # Even if dead/empty, we move if we have speed (inertia)
+        self.y += self.speed
+        
+        # If wrecked (0 health), force stop faster
+        if self.health <= 0:
+            self.speed *= 0.9 # Rapid deceleration
+            if self.speed < 0.1:
+                self.speed = 0
+            
+        # Nitro timer
+        if self.nitro_active > 0:
+            self.nitro_active -= 1
             
     def update(self):
         """Update car physics."""
@@ -377,6 +510,27 @@ class Car:
             # Drafting indicator
             if self.is_drafting:
                 pygame.draw.circle(surface, (100, 255, 255), (screen_x + self.width//2, screen_y - 5), 3)
+                
+            # Damage Visuals (Smoke/Fire)
+            if self.health < self.stats.durability * 0.5:
+                # Smoke
+                smoke_color = (100, 100, 100)
+                if self.health <= 0:
+                    smoke_color = (50, 50, 50) # Dark smoke for dead
+                    
+                # Random puff
+                if random.random() < 0.3:
+                    sx = screen_x + random.randint(0, self.width)
+                    sy = screen_y + random.randint(0, self.height)
+                    pygame.draw.circle(surface, smoke_color, (sx, sy), random.randint(2, 6))
+                    
+            if self.health <= 0:
+                # Fire if wrecked
+                if random.random() < 0.2:
+                    fx = screen_x + random.randint(0, self.width)
+                    fy = screen_y + random.randint(0, self.height)
+                    pygame.draw.circle(surface, (255, 100, 0), (fx, fy), random.randint(3, 8))
+                    pygame.draw.circle(surface, (255, 255, 0), (fx, fy), random.randint(1, 4))
 
 
 class AIDriver:
@@ -386,7 +540,7 @@ class AIDriver:
         self.target_speed_offset = random.uniform(-AI_SPEED_VARIANCE, AI_SPEED_VARIANCE)
         self.lane_preference = random.choice([-1, 0, 1])  # left, center, right tendency
         
-    def update(self, track_center):
+    def update(self, track_center, obstacles, other_cars):
         """Update AI decision making."""
         if self.car.dead or self.car.finished:
             return
@@ -399,29 +553,139 @@ class AIDriver:
         elif self.car.throttle > target_throttle:
             self.car.adjust_throttle(-10)
             
-        # Drift toward lane preference
-        target_x = track_center + (self.lane_preference * 60)
-        if self.car.x < target_x - 10:
-            self.car.steer(1)
-        elif self.car.x > target_x + 10:
-            self.car.steer(-1)
+        # Steering Logic
+        steer_dir = 0
+        avoiding = False
+        
+        # 1. Obstacle Avoidance (High Priority)
+        look_ahead = 400 # Increased lookahead
+        
+        # Combine obstacles and dead cars for avoidance
+        all_hazards = list(obstacles)
+        for other in other_cars:
+            if other != self.car and other.dead:
+                all_hazards.append(other)
+        
+        for obs in all_hazards:
+            # Only care if it's ahead of us
+            if obs.y > self.car.y and obs.y < self.car.y + look_ahead:
+                # Check lateral overlap with INCREASED margin
+                # Use a wider safety net (1.5x width)
+                safe_dist = (self.car.width + obs.width) * 0.8
+                if abs(obs.x - self.car.x) < safe_dist: 
+                    avoiding = True
+                    # Steer away from center of obstacle
+                    # Stronger steering response
+                    if self.car.x < obs.x + obs.width/2:
+                        steer_dir = -1 # Go left
+                    else:
+                        steer_dir = 1 # Go right
+                    break
+        
+        # 2. Car Avoidance (Medium Priority)
+        if not avoiding:
+            for other in other_cars:
+                if other == self.car or other.dead or other.finished:
+                    continue
+                # Only avoid if they are slower or we are drafting too close
+                if other.y > self.car.y and other.y < self.car.y + look_ahead:
+                     if abs(other.x - self.car.x) < self.car.width + 15: # Increased margin
+                         # Car ahead!
+                         avoiding = True
+                         if self.car.x < other.x + other.width/2:
+                             steer_dir = -1
+                         else:
+                             steer_dir = 1
+                         break
+
+        # 3. Lane Preference (Low Priority)
+        if not avoiding:
+            target_x = track_center + (self.lane_preference * 60)
+            if self.car.x < target_x - 10:
+                steer_dir = 1
+            elif self.car.x > target_x + 10:
+                steer_dir = -1
+                
+        # Apply steer
+        if steer_dir != 0:
+            self.car.steer(steer_dir)
 
 
-def handle_physics(cars):
+class Obstacle:
+    def __init__(self, x, y, type="rock"):
+        self.x = x
+        self.y = y
+        self.type = type
+        self.width = 30
+        self.height = 30
+        self.color = (100, 50, 0) # Brown rock
+        self.damage = 20.0
+        
+        if type == "barrier":
+            self.width = 40
+            self.height = 20
+            self.color = (200, 200, 200)
+            self.damage = 40.0
+            
+    def get_rect(self):
+        return pygame.Rect(self.x, self.y, self.width, self.height)
+        
+    def draw(self, surface, camera_y):
+        screen_y = SCREEN_HEIGHT - (self.y - camera_y)
+        if -50 < screen_y < SCREEN_HEIGHT + 50:
+            pygame.draw.rect(surface, self.color, (self.x, screen_y, self.width, self.height))
+            # Simple detail
+            pygame.draw.rect(surface, (0,0,0), (self.x, screen_y, self.width, self.height), 1)
+
+
+def handle_physics(cars, obstacles=None):
     """Resolve collisions and drafting for all cars."""
+    if obstacles is None:
+        obstacles = []
+        
     # Reset drafting state
     for car in cars:
         car.is_drafting = False
         
     # Check every pair
     for i, car_a in enumerate(cars):
-        if car_a.dead or car_a.finished:
+        if car_a.finished:
             continue
             
         rect_a = car_a.get_rect()
         
+        # Check Obstacles
+        for obs in obstacles:
+            if rect_a.colliderect(obs.get_rect()):
+                # Hit obstacle
+                # Determine if head-on
+                # If car is moving forward and hits obstacle with front
+                # A.y < Obs.y (A is behind Obs)
+                # Overlap in X is significant
+                
+                is_head_on = False
+                if car_a.y < obs.y:
+                    x_overlap = min(car_a.x + car_a.width, obs.x + obs.width) - max(car_a.x, obs.x)
+                    if x_overlap > car_a.width * 0.8:
+                        is_head_on = True
+                
+                if is_head_on:
+                    car_a.health = 0
+                    car_a.dead = True
+                    car_a.speed = 0
+                else:
+                    # Glancing blow
+                    # Ensure minimum damage even at low speed to prevent infinite stuck loops
+                    dmg_amount = max(1.0, obs.damage) 
+                    car_a.apply_damage(dmg_amount, "FRONT") 
+                    car_a.speed *= 0.5
+                    
+                    # Bounce back slightly
+                    if car_a.y < obs.y: 
+                        car_a.y = obs.y - car_a.height - 5 # Increased bounce back distance
+                
         for j, car_b in enumerate(cars):
-            if i == j or car_b.dead or car_b.finished:
+            if i == j or car_b.finished:
                 continue
                 
             rect_b = car_b.get_rect()
@@ -438,18 +702,34 @@ def handle_physics(cars):
                     if dx > 0: # A is to the right
                         car_a.x += push
                         car_b.x -= push
+                        # A hit Left side, B hit Right side
+                        car_a.apply_damage(5.0, "FL" if car_a.y > car_b.y else "RL") # Rough approx
+                        car_b.apply_damage(5.0, "FR" if car_b.y > car_a.y else "RR")
                     else: # A is to the left
                         car_a.x -= push
                         car_b.x += push
+                        car_a.apply_damage(5.0, "FR" if car_a.y > car_b.y else "RR")
+                        car_b.apply_damage(5.0, "FL" if car_b.y > car_a.y else "RL")
+                        
                 else:
                     # Rear-end collision
-                    # The one behind (smaller y) slows down, one ahead speeds up slightly
                     if dy < 0: # A is behind B
                         car_a.speed *= 0.9
                         car_a.y = car_b.y - car_a.height - 1 # Force separate
+                        
+                        # A hits with Front, B hits with Rear
+                        impact = abs(car_a.speed - car_b.speed) * 2.0
+                        car_a.apply_damage(impact, "FRONT")
+                        car_b.apply_damage(impact, "REAR")
+                        
                     else: # A is ahead of B
                         car_b.speed *= 0.9
                         car_b.y = car_a.y - car_b.height - 1
+                        
+                        # B hits with Front, A hits with Rear
+                        impact = abs(car_a.speed - car_b.speed) * 2.0
+                        car_b.apply_damage(impact, "FRONT")
+                        car_a.apply_damage(impact, "REAR")
                         
             # 2. Drafting Check
             # Check if A is drafting B (A is behind B)
@@ -472,60 +752,95 @@ def handle_physics(cars):
 
 def draw_hud(surface, player, split_text=None):
     """Draw resource bars and info."""
-    hud_height = 80
+    hud_height = 100 # Increased height for 3 bars
     hud_rect = pygame.Rect(0, SCREEN_HEIGHT - hud_height, SCREEN_WIDTH, hud_height)
     pygame.draw.rect(surface, COLOR_HUD_BG, hud_rect)
     
     bar_width = 120
-    bar_height = 15
+    bar_height = 12
     bar_x = 20
+    
+    # Health bar
+    health_pct = max(0.0, player.health / player.stats.durability)
+    pygame.draw.rect(surface, (40, 40, 40), (bar_x, SCREEN_HEIGHT - 85, bar_width, bar_height))
+    pygame.draw.rect(surface, (50, 255, 50), (bar_x, SCREEN_HEIGHT - 85, int(bar_width * health_pct), bar_height))
+    
+    # Draw Car Diagram (Damage Status)
+    diag_x = 300
+    diag_y = SCREEN_HEIGHT - 85
+    diag_w = 30
+    diag_h = 50
+    
+    # Helper to get color from health (1.0=Green, 0.0=Red)
+    def get_dmg_color(val):
+        r = min(255, int(255 * (1.0 - val) * 2))
+        g = min(255, int(255 * val * 2))
+        return (r, g, 0)
+        
+    # Front (Engine)
+    pygame.draw.rect(surface, get_dmg_color(player.comp_front), (diag_x + 5, diag_y, 20, 15))
+    # Rear (Fuel)
+    pygame.draw.rect(surface, get_dmg_color(player.comp_rear), (diag_x + 5, diag_y + 35, 20, 15))
+    # FL Tire
+    pygame.draw.rect(surface, get_dmg_color(player.comp_fl), (diag_x, diag_y + 10, 5, 10))
+    # FR Tire
+    pygame.draw.rect(surface, get_dmg_color(player.comp_fr), (diag_x + 25, diag_y + 10, 5, 10))
+    # RL Tire
+    pygame.draw.rect(surface, get_dmg_color(player.comp_rl), (diag_x, diag_y + 30, 5, 10))
+    # RR Tire
+    pygame.draw.rect(surface, get_dmg_color(player.comp_rr), (diag_x + 25, diag_y + 30, 5, 10))
+    # Body Outline
+    pygame.draw.rect(surface, (200, 200, 200), (diag_x + 5, diag_y + 15, 20, 20), 1)
     
     # Fuel bar
     fuel_pct = player.fuel / player.stats.fuel_capacity
-    pygame.draw.rect(surface, (40, 40, 40), (bar_x, SCREEN_HEIGHT - 70, bar_width, bar_height))
-    pygame.draw.rect(surface, COLOR_FUEL, (bar_x, SCREEN_HEIGHT - 70, int(bar_width * fuel_pct), bar_height))
+    pygame.draw.rect(surface, (40, 40, 40), (bar_x, SCREEN_HEIGHT - 65, bar_width, bar_height))
+    pygame.draw.rect(surface, COLOR_FUEL, (bar_x, SCREEN_HEIGHT - 65, int(bar_width * fuel_pct), bar_height))
     
     # Heat bar
     heat_pct = player.heat / player.stats.heat_capacity
     heat_color = COLOR_HEAT if player.heat < HEAT_WARNING else (255, 50, 50)
-    pygame.draw.rect(surface, (40, 40, 40), (bar_x, SCREEN_HEIGHT - 50, bar_width, bar_height))
-    pygame.draw.rect(surface, heat_color, (bar_x, SCREEN_HEIGHT - 50, int(bar_width * heat_pct), bar_height))
+    pygame.draw.rect(surface, (40, 40, 40), (bar_x, SCREEN_HEIGHT - 45, bar_width, bar_height))
+    pygame.draw.rect(surface, heat_color, (bar_x, SCREEN_HEIGHT - 45, int(bar_width * heat_pct), bar_height))
     
     # Throttle indicator
     throttle_x = 160
-    pygame.draw.rect(surface, (40, 40, 40), (throttle_x, SCREEN_HEIGHT - 70, 30, 35))
-    throttle_height = int(35 * (player.throttle / 100))
+    pygame.draw.rect(surface, (40, 40, 40), (throttle_x, SCREEN_HEIGHT - 85, 30, 52))
+    throttle_height = int(52 * (player.throttle / 100))
     pygame.draw.rect(surface, COLOR_THROTTLE, 
-                    (throttle_x, SCREEN_HEIGHT - 35 - throttle_height + 35, 30, throttle_height))
+                    (throttle_x, SCREEN_HEIGHT - 33 - throttle_height + 33, 30, throttle_height))
     
     # Draw throttle text value
     font = pygame.font.Font(None, 20)
     throt_text = font.render(f"{int(player.throttle)}%", True, (255, 255, 255))
-    surface.blit(throt_text, (throttle_x, SCREEN_HEIGHT - 85))
+    surface.blit(throt_text, (throttle_x, SCREEN_HEIGHT - 98))
     
     # Nitro charges
     nitro_x = 210
     for i in range(NITRO_CHARGES):
         color = (255, 200, 0) if i < player.nitro_charges else (60, 60, 60)
-        pygame.draw.rect(surface, color, (nitro_x + i * 25, SCREEN_HEIGHT - 70, 20, 35))
+        pygame.draw.rect(surface, color, (nitro_x + i * 25, SCREEN_HEIGHT - 85, 20, 52))
     
     # Speed / position readout
     font = pygame.font.Font(None, 24)
     speed_text = font.render(f"SPD: {player.speed:.1f}", True, (200, 200, 200))
     pos_text = font.render(f"POS: {int(player.y)}/{player.race_length}", True, (200, 200, 200))
     tier_text = font.render(f"TIER: {player.stats.name}", True, (150, 150, 255))
-    surface.blit(speed_text, (SCREEN_WIDTH - 100, SCREEN_HEIGHT - 70))
-    surface.blit(pos_text, (SCREEN_WIDTH - 100, SCREEN_HEIGHT - 50))
-    surface.blit(tier_text, (SCREEN_WIDTH - 150, SCREEN_HEIGHT - 30))
+    surface.blit(speed_text, (SCREEN_WIDTH - 100, SCREEN_HEIGHT - 85))
+    surface.blit(pos_text, (SCREEN_WIDTH - 100, SCREEN_HEIGHT - 65))
+    surface.blit(tier_text, (SCREEN_WIDTH - 150, SCREEN_HEIGHT - 45))
     
     # Split Time
     if split_text:
         split_surf = font.render(split_text, True, (255, 255, 0))
-        surface.blit(split_surf, (SCREEN_WIDTH - 250, SCREEN_HEIGHT - 70))
+        surface.blit(split_surf, (SCREEN_WIDTH - 250, SCREEN_HEIGHT - 85))
     
     # Status
     if player.dead:
-        status = font.render("ENGINE DEAD", True, (255, 50, 50))
+        if player.health <= 0:
+            status = font.render("WRECKED!", True, (255, 50, 50))
+        else:
+            status = font.render("ENGINE DEAD", True, (255, 50, 50))
         surface.blit(status, (SCREEN_WIDTH // 2 - 50, SCREEN_HEIGHT - 30))
     elif player.finished:
         status = font.render("FINISHED!", True, (50, 255, 50))
@@ -668,6 +983,18 @@ def main():
         # AI uses same tier for now
         ai_cars.append(AIDriver(Car(pos[0], pos[1], COLOR_AI, current_tier, current_race.length)))
     
+    # Generate Obstacles
+    obstacles = []
+    track_left = (SCREEN_WIDTH - TRACK_WIDTH) // 2
+    track_right = track_left + TRACK_WIDTH
+    
+    # Start placing after the grid (e.g. 2000) up to finish
+    for _ in range(30): # 30 obstacles
+        oy = random.randint(2000, current_race.length - 1000)
+        ox = random.randint(track_left + 20, track_right - 50)
+        otype = random.choice(["rock", "barrier"])
+        obstacles.append(Obstacle(ox, oy, otype))
+        
     running = True
     race_over = False
     race_time = 0
@@ -764,22 +1091,35 @@ def main():
                     player.fuel = min(player.stats.fuel_capacity, player.fuel + fuel_gain)
                     player.heat = max(0.0, player.heat - heat_loss)
                     
+                    # If we were coasting on empty, we are back in the game!
+                    # But NOT if we are wrecked (health <= 0) or overheated (dead=True)
+                    if not player.dead and player.health > 0:
+                         pass # Fuel added above is enough to keep going
+                    
                     popup_text = "CHECKPOINT! +FUEL -HEAT"
                     popup_timer = 120 # 2 seconds
             
             for ai in ai_cars:
-                ai.update(track_center)
+                ai.update(track_center, obstacles, all_cars)
                 ai.car.update()
                 
             # Physics
-            handle_physics(all_cars)
+            handle_physics(all_cars, obstacles)
             
             # Update finish status
             for car in all_cars:
                 car.check_finish(race_time)
             
             # Check race end (Player finished)
-            if player.finished or player.dead:
+            # Only end if player finished or is WRECKED (dead from health)
+            # If just out of fuel, we wait until speed is 0
+            if player.finished:
+                race_over = True
+            elif player.dead: # Wrecked or Overheated
+                race_over = True
+            elif player.fuel <= 0 and player.speed < 0.1:
+                # Out of fuel and stopped
+                player.dead = True # Now we are officially dead
                 race_over = True
         
         # Rank Tracking & Sorting (Always update for HUD/Splits)
@@ -793,6 +1133,10 @@ def main():
         # Draw
         draw_track(screen, camera_y, current_race.length, current_race.checkpoints)
         
+        # Draw Obstacles
+        for obs in obstacles:
+            obs.draw(screen, camera_y)
+            
         # Draw AI cars
         for ai in ai_cars:
             ai.car.draw(screen, camera_y)
